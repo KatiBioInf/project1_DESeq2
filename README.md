@@ -17,8 +17,12 @@ The repository does not contain the data but those can be obtianed by running th
 The scripts and the Rmd file contain links to extra material and additional remarks.
 
 Sources:
+
 https://www.youtube.com/watch?v=UWXv9dUpxNE&t=2054s
+
 https://bioconductor.org/packages/devel/bioc/manuals/DESeq2/man/DESeq2.pdf
+
+https://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html
 
 
 
