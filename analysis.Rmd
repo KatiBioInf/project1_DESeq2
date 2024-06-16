@@ -1,0 +1,516 @@
+---
+title: "DESeq2 analysis"
+author: "Katalin Buzasi"
+date: "2024-06-09"
+output:
+ html_document:
+   toc: true
+   toc_depth: 3
+   number_sections: true
+   theme: united
+   highlight: tango
+---
+
+```{r setup, include=FALSE}
+# load libraries
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(tidyverse)
+library(pheatmap)
+library(DESeq2)
+library(ggplot2)
+library(apeglm)
+# library(annotables)
+# library(biomaRt)
+# library(AnnotationDbi)
+# library(EnsDb.Hsapiens.v75)
+library(dplyr)
+library(RColorBrewer)
+library(ggrepel)
+library(kableExtra)
+library(DT)
+```
+
+```{r include=F}
+# load data (summarized experiment object)
+load("tcga_kirc_data.RData")
+
+```
+
+
+```{r include=F}
+# create DESeqDataSet object
+
+# counts
+
+counts <- as.data.frame(assay(tcga_kirc_data, withDimnames = T, "unstranded"))
+
+# cleaning up sample names
+## we keep only the first 16 characters of the column names
+
+colnames(counts)[1:6] <- sapply(colnames(counts)[1:6], function(x){
+  substr(x, 1,16)
+})
+
+# samples (coldata)
+
+# extracting sample names
+samples <- tcga_kirc_data$sample
+
+# types of samples (tumor vs. normal)
+types <- tcga_kirc_data$tissue_type
+
+# making data frame
+coldata <- as.data.frame(types, row.names = samples)
+
+# setting factor levels (used as design later)
+coldata$types <- factor(coldata$types, levels = c("Normal", "Tumor"))
+
+# # IMPORTANT!!!: the order of samples should be the same in the count and coldata data frames
+# 
+# # checking if the order of rowdata and coldata are the same
+# 
+# rownames(coldata)
+# 
+# # [1] "TCGA-CW-5584-01A" "TCGA-CZ-5984-01A" "TCGA-B0-4841-01A" "TCGA-CZ-5985-11A" "TCGA-CZ-5451-11A"
+# # [6] "TCGA-B0-5691-11A"
+# 
+# colnames(counts)
+# 
+# # [1] "TCGA-CW-5584-01A" "TCGA-CZ-5984-01A" "TCGA-B0-4841-01A" "TCGA-CZ-5985-11A" "TCGA-CZ-5451-11A"
+# # [6] "TCGA-B0-5691-11A"
+# 
+# # do we have the samples in the same order in the two datasets? yes
+# 
+# # alternative
+# 
+# all(rownames(coldata) == colnames(counts))
+
+################################ creating object
+
+# putting it all together
+# the design will be tumor vs. normal
+
+dds <- DESeqDataSetFromMatrix(countData = counts,
+                              colData = coldata,
+                              design = ~ types)
+
+# it is not necessary but we can add extra info on genes, e.g. gene names, gene type 
+# (useful for later visualization)
+
+genename <- data.frame(gene_name=tcga_kirc_data@rowRanges$gene_name)
+genetype <- data.frame(gene_type=tcga_kirc_data@rowRanges$gene_type)
+mcols(dds) <- DataFrame(mcols(dds), genename, genetype)
+```
+
+
+# Introduction
+
+The aim of this document is to perform differential gene expression analysis with [DESEq2](https://bioconductor.org/packages/release/bioc/html/DESeq2.html) on normal (N=3) and tumor (N=3) samples from the [TCGA-KIRC](https://portal.gdc.cancer.gov/projects/TCGA-KIRC) (Kidney Renal Clear Cell Carcinoma) project. The data were obtained as described in the script '01_data_download.R' following [this tutorial](https://www.youtube.com/watch?v=UWXv9dUpxNE&t=2054s).
+
+The sample barcodes included in the analysis with sample type information are shown in Table 1. These samples were selected randomly for demonstration purposes.
+
+```{r echo=F}
+
+datatable(coldata, caption="Table 1. Samples")
+
+```
+
+The structure of this document is as follows:
+
+* Obtaining data (see script titled '01_data_download.R')
+* Creating [SummarizedExperiment](https://www.bioconductor.org/packages/devel/bioc/vignettes/SummarizedExperiment/inst/doc/SummarizedExperiment.html) object (see script titled '01_data_download.R')
+* Creating [DESeqDataSet](https://rdrr.io/bioc/DESeq2/man/DESeqDataSet.html) object (required format of DESeq2) (see script titled '03_DGE_DESeq2.R')
+* Data preprocessing (see script titled '03_DGE_DESeq2.R')
+* Data exploration (see script titled '03_DGE_DESeq2.R')
+* Differential gene expression analysis (see script titled '03_DGE_DESeq2.R')
+* Result exploration and visualization (see script titled '04_exploring_results.R')
+
+# Data exploration
+
+The basic dataset contains 6 samples (see Table 1) and 60,660 genes. The head of the count table is displayed in Table 2 including Ensemble ID's and raw counts (non-normalized which is required for the DESeq analysis). Genes with low count were filtered out (min. count is 3 at least in 3 of the samples). This step leaves us with 25,987 genes.
+
+
+```{r echo=FALSE}
+datatable(head(counts), caption="Table 2. Raw counts - first few lines")
+
+```
+
+
+Next, we investigate how similar normal and tumor samples are to each other using pairwise correlation and principal component analysis based on normalized counts using the variance stabilizing transformation ([VST](https://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#variance-stabilizing-transformation)). The aim of this step is to detect potential outliers and other problems with the data. The clustered heatmap of pairwise correlations between samples is in Figure 1. The correlation is high between samples of the same type: normal samples are clustered with normal samples and tumor samples tend to cluster with other tumor samples. Samples separate nicely on the first principal component in Figure 2 as well. The first principal component accounts for 77% of the total variance. Tumor samples show higher variation on the second principal component, which accounts for 14% of the variation, than normal samples. The conclusion from Figure 1 and 2 is that tumor samples are much more similar to each other than to normal samples in terms of gene expression and vice versa. This is what we want to see because this finding indicates that there are no weird patterns in the data. If we find something odd, we need to look into the causes of these unexpected patterns and the potential solutions (e.g. remove outliers, potential mismatch between the order of sample names in the count and sample datasets). Since everything looks good and as expected we can go on with the differential gene expression analysis.
+
+```{r include=F}
+# some data preprocessing
+
+######################## filtering
+
+# we filter out genes with low counts
+
+keep <- rowSums( counts(dds) >= 3 ) >= 3
+dds <- dds[keep,]
+
+# counts(dds)
+
+# we are left with 25987 genes in place of 60660
+
+# we can filter out genes with low variance as well, we do not do it now
+
+######################## normalization for library size
+
+## step 1: estimate size factors (median ratio method)
+# extra info is added to colData 
+dds <- estimateSizeFactors(dds)
+dds
+
+# inspect size factors
+
+## method 1
+dds$sizeFactor
+
+## method 2
+sizeFactors(dds)
+
+## step 2: calculating normalized counts (this does not affect the dds object itself)
+
+normalized_counts <- counts(dds, normalized = T)
+
+```
+
+```{r echo=F, warning=FALSE, message=FALSE}
+############################### cluster analysis
+
+## step 1: transformation (log transformation, variance stabilizing transformation - vst)
+
+vst_dds <- vst(dds, blind=T)
+#vst_dds
+#assay(vst_dds)
+
+## step 2: extract the vst matrix and compute pairwise correlation between samples
+
+### extraction
+vst_dds_mat <- assay(vst_dds)
+
+### correlation
+
+vst_dds_cor <- cor(vst_dds_mat)
+
+## step 3: heatmap
+
+pheatmap(vst_dds_cor, annotation = dplyr::select(coldata, types),
+                     main = "Figure 1. Sample correlation and clustering")
+
+```
+
+```{r echo=F, message=FALSE, warning=FALSE}
+############################# pca
+
+plotPCA(vst_dds, intgroup="types")+
+  geom_text_repel(aes(label = rownames(coldata)))+
+  theme_classic()+
+  ggtitle("Figure 2. PCA plot")
+
+```
+
+
+# Differential gene expression analysis with DESeq2
+
+The DESeq2 workflow consists of the following steps (we followed this [tutorial](https://hbctraining.github.io/DGE_workshop/lessons/04_DGE_DESeq2_analysis.html) to a large extent):
+
+* Modelling (command 'DESeq' performing three major steps: estimation of size factors, estimation of dispersion, negative binomial GLM fitting and Wald statistics)
+
+* Inspecting dispersion plot (Figure 3)
+
+* Contrast testing log2 fold changes (experimental design: tumor vs. normal, Figure 4)
+
+* Shrinking log2 fold changes (Figure 5)
+
+The dispersion plot looks as expected: dispersion values decrease with increasing mean. No [weird patterns](https://support.bioconductor.org/p/9149870/), so we can go on with the next step: contrast testing and log2-fold change shrinkage.
+
+```{r include=F}
+
+# STEP 1: modeling
+# estimate size factors and estimate variation across samples for each gene
+# NB estimation
+
+# we already have de DESeq2 object
+
+# fitting the NB model
+
+dds <- DESeq(dds)
+
+```
+
+
+```{r echo=F, message=FALSE, warning=FALSE}
+# STEP 2: exploring dispersion estimates 
+
+# how well do our data fit the model?
+# log2 fold changes
+
+plotDispEsts(dds, main = "Figure 3. Dispersion plot")
+
+
+# we expect dispersion values to decrease with increasing mean
+# when you have only a few replicates, the estimates are often inaccurate - use info across all genes 
+# to estimate the most likely dispersion for a given mean expression value (red line)
+# the original estimates are shrunken towards the red line to avoid false positives
+# the shrinkage depends on distance to the curve and sample size
+```
+
+```{r include=F}
+# STEP 3: contrasts testing log2 fold changes based on modelled counts
+
+dge_model_results <- results(dds, alpha=0.05)
+```
+
+```{r echo=F}
+# MA plot before shrinkage
+
+plotMA(dge_model_results, main = "Figure 4. MA plot - before shrinkage")
+```
+
+```{r include=F}
+# STEP 4: shrink log2 fold changes
+
+dge_model_results <- lfcShrink(dds,
+                               coef=2,
+                                        res = dge_model_results)
+```
+
+```{r echo=F}
+plotMA(dge_model_results, main = "Figure 5. MA plot - after shrinkage")
+```
+
+
+# Visualization of results
+
+## Summary
+
+The results of the DESEq2 analysis is saved in a table with columns and information listed in Table 3. 
+
+```{r echo=F}
+datatable(data.frame(mcols(dge_model_results)), caption = "Table 3. Columns of the result tables")
+
+```
+
+The first few rows of the results per gene (rows) are displayed in Table 4. A negative sign in the 'log2FoldChange' column means that the genes are downregulated in tumor samples compared to normal samples, a positive sign means   the opposite. 
+
+```{r echo=FALSE}
+datatable(head(data.frame(dge_model_results) %>% 
+                 dplyr::mutate_if(is.numeric, round, digits = 4), n=20), caption="Table 4. DGE Result table")
+```
+
+An bird-eye overview of the upregulated and downregulated genes (in tumor samples compared to normal samples) can be obtained with the command 'summary'. The number of upregulated genes is 2,674 (10%) and the number of downregulated genes is 2,810 (11%) at significance level of 5%. The number of outliers is 299 (1.2%) and the number of genes with low count (average count < 3 across samples) is 1,008 (3.9%).
+
+```{r include=FALSE}
+summary(dge_model_results)
+```
+
+```{r include=F}
+# extracting dge results as dataframe
+# we remove the gene names as rowid, it will be a column so that we can merge with additional data
+# we also remove all characters after the . in the gene names
+
+dge_model_results_sig <- data.frame(dge_model_results) %>% 
+  arrange(padj) %>% 
+  dplyr::filter(padj<0.05) %>% 
+  rownames_to_column(var="ensid") 
+```
+
+## Volcano plot
+
+The [volcano plot](https://www.youtube.com/watch?v=7aWAdw2jhj0) (Figure 6) shows log2fold change (x-axis) and statistical significance (y-axis). In order to be able to show the border between significant (adjusted p-value < 0.05) and non-significant fold changes, the y-axis has been limited to values between 0 and 15. 
+
+```{r include=FALSE}
+# data prep for volcano plot
+dge_model_results_volcano <- data.frame(dge_model_results) %>% 
+  rownames_to_column(var="ensid") %>% 
+  dplyr::mutate(threshold = padj < 0.05)
+```
+
+```{r echo=F, warning=FALSE, message=FALSE}
+# plot
+ggplot(dge_model_results_volcano)+
+  geom_point(aes(x = log2FoldChange,
+                 y = -log10(padj),
+                 color = threshold),
+             size=0.8)+
+  scale_color_manual(values=c("#CDB9B4", "#F43911"))+
+  theme_classic()+
+  xlab("log2 fold change")+
+  ylab("-log10 adj. p-value")+
+  theme(legend.position = "right",
+        plot.title = element_text(size=rel(1.5), hjust = 0.5),
+        axis.title = element_text(size = rel(1.25)))+
+  ylim(0,15)+
+  ggtitle("Figure 6. Volcano plot")
+```
+
+## Heatmap
+
+Relying only on genes that are significantly differently expressed between tumor and normal samples only, we can build a [heatmap](https://www.youtube.com/watch?v=Bfx9R5mL2NY) to investigate how samples cluster based on normalized gene counts. Genes are displayed as rows, samples are displayed as columns. The values are normalized counts centered and scaled in the row direction (across genes). Figure 7 shows that tumor samples indeed cluster together: they are similar to each other in the sense that the same genes tend to get upregulated and downregulated relative to normal samples.
+
+```{r include=F}
+# based on the differentially expressed genes
+# heatmaps are based on normalized counts
+
+norm_count_sig <- normalized_counts[dge_model_results_sig$ensid, ]
+
+heat_colors <- brewer.pal(8, "RdYlBu")
+```
+
+```{r echo=F}
+
+pheatmap(norm_count_sig,
+         color=heat_colors,
+         cluster_rows=T,
+         show_rownames = F,
+         annotation=dplyr::select(coldata, types),
+         scale="row",
+         main="Figure 7. Sample clusterisation based on DEGs")
+
+```
+
+```{r include=F}
+
+### EXPLORING THE DIFFERENTIALLY EXPRESSED GENES based on type and function (only simple, no gsea)
+
+# extracting dge results as dataframe
+# we remove the gene names as rowid, it will be a column so that we can merge
+# we also remove all characters after the . in the gene names
+
+## adding gene symbol and gene type information to results data frame
+
+df_results <- data.frame(dge_model_results) %>% 
+  arrange(padj) %>% 
+  dplyr::filter(padj<0.05) %>% 
+  rownames_to_column(var="ensid") %>% 
+  dplyr::mutate(ensid=gsub("\\..*","",ensid))
+
+
+df_symbol <- data.frame(rowData(dds)[c('gene_name', 'gene_type')]) %>%
+  rownames_to_column(var="ensid") %>% 
+  dplyr::mutate(ensid=gsub("\\..*","",ensid))
+
+df_results <- df_results %>% 
+  left_join(df_symbol, by="ensid") 
+
+# which types are the genes that are differentially expressed
+
+# focus on the two major types: lncRNA and protein coding
+
+df_results %>% 
+  dplyr::select(ensid, gene_name, log2FoldChange, gene_type) %>% 
+  dplyr::mutate(sign=case_when(log2FoldChange<0 ~ " neg.",
+                               log2FoldChange>0 ~ " pos.")) %>% 
+  ungroup() %>% 
+  group_by(gene_type, sign) %>% 
+  dplyr::summarise(N=n()) %>% 
+  # focus only on the two largest groups: protein coding and lncRNA
+  dplyr::filter(gene_type=="protein_coding" | gene_type=="lncRNA") %>% 
+  ggplot(aes(fill=sign, y=N, x=gene_type)) + 
+  scale_fill_manual(values=c("#CDB9B4", "#F43911"))+
+  geom_bar(position="dodge", stat="identity")+
+  theme_classic()+
+  ggtitle("The major types of sign. expressed genes")+
+  xlab("gene type")
+
+```
+
+## Dot charts - focussing on selected genes
+
+In order to get an idea of the most important genes, we extract the top 200 differentially expressed genes (Table 5). First, we keep the 200 genes with the lowest adjusted p-value and then arrange the table according to the absolute value of the  column 'log2FoldChange'. The table also contains the ensembl ID (values after the decimals removed), gene name and gene type.
+
+We find gene ['CPNE6'](https://www.ncbi.nlm.nih.gov/gene/9362#gene-expression), a protein-coding gene, at the top of the list which seems to be much less expressed in tumor samples than in normal samples. The second one is ['OSTM1-AS1'](https://www.ncbi.nlm.nih.gov/gene/100287366), a non-coding RNA gene, which is much higher expressed in tumor samples than in normal samples. This gene has been linked to [Wilms' tumor](https://pubmed.ncbi.nlm.nih.gov/35946509/) or nephroblastoma.
+
+
+```{r echo=FALSE}
+
+
+datatable(head(data.frame(df_results) %>%
+                 arrange(padj) %>% 
+                 dplyr::mutate_if(is.numeric, round, digits = 5), n=200) %>% 
+            arrange(desc(abs(log2FoldChange))), caption="Table 5. The top 200 DEGs")
+```
+
+The normalized counts for the two sample types (tumor and normal) for the genes ['PGF'](https://www.ncbi.nlm.nih.gov/gene/5228) and ['CALB1'](https://www.ncbi.nlm.nih.gov/gene/793) are visualized in Figure 8 and 9, respectively
+
+```{r include=F}
+# data prep
+
+# PGF
+
+df_symbol <- data.frame(rowData(dds)[c('gene_name', 'gene_type')]) %>%
+  rownames_to_column(var="ensid")
+
+df_dot_chart <- data.frame(normalized_counts) %>% 
+  rownames_to_column(var="ensid") %>% 
+  left_join(df_symbol, by="ensid") 
+
+# PGF
+
+df_coldata <- data.frame(coldata) %>% 
+  rownames_to_column(var="sample")
+
+df_pgf <- df_dot_chart %>% 
+  dplyr::select(c(2:8)) %>% 
+  dplyr::filter(gene_name=="PGF") %>% 
+  dplyr::select(-gene_name) %>% 
+  t() %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var="sample") 
+
+
+colnames(df_pgf) <- c("sample", "norm_count")
+
+df_pgf$sample <- gsub("\\.", "-", df_pgf$sample)
+
+df_pgf <- df_pgf %>% 
+    left_join(df_coldata, by="sample")
+
+```
+
+```{r echo=F, message=F, warning=FALSE}
+ggplot(df_pgf, aes(x=types, y=norm_count, fill=types)) + 
+  geom_dotplot(binaxis='y', stackdir='center')+
+  scale_fill_manual(values=c("#9FF3BD", "#F43911"))+
+  theme_classic()+
+  theme(legend.position = "none")+
+  ggtitle("Figure 8. Gene: PGF")+
+  xlab("sample type")+
+  ylab("normalized count")
+```
+
+```{r include=F}
+# CALB1
+
+df_calb1 <- df_dot_chart %>% 
+  dplyr::select(c(2:8)) %>% 
+  dplyr::filter(gene_name=="CALB1") %>% 
+  dplyr::select(-gene_name) %>% 
+  t() %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var="sample") 
+
+
+colnames(df_calb1) <- c("sample", "norm_count")
+
+df_calb1$sample <- gsub("\\.", "-", df_calb1$sample)
+
+df_calb1 <- df_calb1 %>% 
+  left_join(df_coldata, by="sample")
+```
+
+```{r echo=F, message=F, warning=FALSE}
+ggplot(df_calb1, aes(x=types, y=norm_count, fill=types)) + 
+  geom_dotplot(binaxis='y', stackdir='center')+
+  scale_fill_manual(values=c("#9FF3BD", "#F43911"))+
+  theme_classic()+
+  theme(legend.position = "none")+
+  ggtitle("Figure 9. Gene: CALB1")+
+  xlab("sample type")+
+  ylab("normalized count")
+```
+
+
+
